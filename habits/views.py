@@ -3,9 +3,11 @@ import uuid
 from django.db.models import Count, ProtectedError, Q
 from django.http import Http404
 from django.utils import timezone
+from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.viewsets import ModelViewSet, ViewSet
+from . import challenges as habit_challenges
 from .analytics import calendar as analytics_calendar
 from .analytics import forecast as analytics_forecast
 from .analytics import metrics as analytics_metrics
@@ -15,14 +17,16 @@ from .analytics import queries as analytics_queries
 from .analytics import trends as analytics_trends
 from .models import Habit, HabitLog, Tag
 from .serializers import (
+  ChallengeSubscriptionSerializer,
   HabitLogSerializer,
   HabitScheduleSerializer,
   HabitSerializer,
   TagSerializer,
 )
-from common.responses import success_response, error_response
 from common.constants import HTTP_ERROR_CODES, RESPONSE_MESSAGES
+from common.enums import ChallengeStatus
 from common.pagination import StandardPagination
+from common.responses import error_response, success_response
 import traceback
 
 
@@ -197,6 +201,238 @@ class HabitViewSet(EnvelopeListMixin, ModelViewSet):
       status_code=HTTP_ERROR_CODES['200_NO_CONTENT'],
       message=RESPONSE_MESSAGES['DATA_DELETED'],
     )
+
+  # ---- Group challenges ----
+
+  def get_challenge(self):
+    """The habit as a challenge template, or 404.
+
+    Participants hold a copy of a challenge rather than the template, so a
+    subscriber asking for their own habit must be routed back to the challenge it
+    came from. Without that, every participant's copy would report itself as an
+    unstartable challenge with no rules and no subscribers.
+
+    Resolution deliberately does not go through `get_object`. That is scoped to
+    the caller's own habits, but a challenge belongs to the group: every member
+    reads its progress and subscribes to it, so scoping the lookup to ownership
+    would hide the challenge from everyone but its author. The two cases are kept
+    apart here - the caller's own habit is taken as-is, and a habit belonging to
+    somebody else is only accepted when it is a group challenge the caller is a
+    member of. `assert_group_member` then re-checks membership on the resolved
+    challenge, so the authorisation does not rest on this lookup alone.
+    """
+    from groups.services import is_member
+
+    try:
+      habit = Habit.objects.filter(is_deleted=False).select_related(
+        'challenge_source', 'tag', 'schedule'
+      ).get(pk=self.kwargs['pk'])
+    except (Habit.DoesNotExist, ValueError):
+      raise NotFound('Habit not found.')
+
+    challenge = habit.challenge_source or habit
+    if not challenge.is_challenge:
+      raise NotFound('Habit not found.')
+
+    # Somebody else's habit is only reachable as a group challenge they are in.
+    if habit.user_id != self.request.user.id and not (
+      habit.group_id is not None and is_member(self.request.user, habit.group)
+    ):
+      raise NotFound('Habit not found.')
+
+    return habit_challenges.sync_and_settle(challenge)
+
+  def assert_group_member(self, request, challenge):
+    """Group membership is the only gate on reading a challenge.
+
+    A non-member gets a 404 rather than a 403: they are outside the group, and
+    confirming the challenge exists would leak it.
+    """
+    from groups.services import is_member
+
+    if challenge.group_id is None or not is_member(request.user, challenge.group):
+      raise NotFound('Habit not found.')
+
+  @action(detail=True, methods=['post'])
+  def start_challenge(self, request, *args, **kwargs):
+    """DRAFT to ACTIVE, by the author or a group admin.
+
+    Starting is manual on purpose: a proposed challenge is a plan, and the group
+    gets to see it before anybody's streak starts counting.
+    """
+    challenge = self.get_challenge()
+    self.assert_group_member(request, challenge)
+
+    if not habit_challenges.can_manage_challenge(request.user, challenge):
+      return _forbidden('Only the challenge author or a group admin can start it.')
+
+    try:
+      habit_challenges.start_challenge(challenge, request.user)
+    except ValueError as exc:
+      return self.challenge_error(exc)
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message='Challenge started.',
+      data=self.get_serializer(challenge).data,
+    )
+
+  @action(detail=True, methods=['post'])
+  def end_challenge(self, request, *args, **kwargs):
+    """Close a challenge early and announce its winner.
+
+    The normal ending is automatic, at the end of the final day. This exists for
+    the two cases that are not: an author standing down, and an admin shutting
+    down a challenge nobody is running.
+    """
+    challenge = self.get_challenge()
+    self.assert_group_member(request, challenge)
+
+    if not habit_challenges.can_manage_challenge(request.user, challenge):
+      return _forbidden('Only the challenge author or a group admin can end it.')
+
+    if challenge.challenge_status == ChallengeStatus.COMPLETED:
+      return self.challenge_error('This challenge has already ended.')
+
+    habit_challenges.complete_challenge(challenge)
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message='Challenge ended.',
+      data=self.get_serializer(challenge).data,
+    )
+
+  @action(detail=True, methods=['post'])
+  def cancel_challenge(self, request, *args, **kwargs):
+    challenge = self.get_challenge()
+    self.assert_group_member(request, challenge)
+
+    if not habit_challenges.can_manage_challenge(request.user, challenge):
+      return _forbidden('Only the challenge author or a group admin can cancel it.')
+
+    try:
+      habit_challenges.cancel_challenge(challenge)
+    except ValueError as exc:
+      return self.challenge_error(exc)
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message='Challenge cancelled.',
+      data=self.get_serializer(challenge).data,
+    )
+
+  @action(detail=True, methods=['post', 'delete'])
+  def subscribe(self, request, *args, **kwargs):
+    """Join a challenge, or leave one.
+
+    Joining hands the member their own copy of the habit, schedule and all. The
+    story says every member can watch everyone's progress whether or not they
+    took part, so opting in only affects what the member is scored on - it is not
+    what makes the challenge visible to them.
+    """
+    challenge = self.get_challenge()
+    self.assert_group_member(request, challenge)
+
+    if request.method == 'POST':
+      if challenge.challenge_status not in (
+        ChallengeStatus.DRAFT,
+        ChallengeStatus.ACTIVE,
+      ):
+        return self.challenge_error(
+          'This challenge is closed and can no longer be joined.'
+        )
+
+      subscription, created = habit_challenges.subscribe(challenge, request.user)
+      return success_response(
+        status_code=HTTP_ERROR_CODES['CREATED' if created else 'SUCCESS'],
+        message='Subscribed to the challenge.' if created else 'Already subscribed.',
+        data=ChallengeSubscriptionSerializer(subscription).data,
+      )
+
+    removed = habit_challenges.unsubscribe(challenge, request.user)
+    if not removed:
+      return error_response(
+        status_code=HTTP_ERROR_CODES['NOT_FOUND'],
+        message='You are not subscribed to this challenge.',
+        errors={'detail': 'No subscription to remove.'},
+      )
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['200_NO_CONTENT'],
+      message=RESPONSE_MESSAGES['DATA_DELETED'],
+    )
+
+  @action(detail=True, methods=['get'])
+  def subscribers(self, request, *args, **kwargs):
+    challenge = self.get_challenge()
+    self.assert_group_member(request, challenge)
+
+    queryset = challenge.subscriptions.select_related('user').order_by('-subscribed_at')
+    page = self.paginate_queryset(queryset)
+    paginator = self.paginator
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message=RESPONSE_MESSAGES['SUCCESS'],
+      data={
+        'count': paginator.page.paginator.count,
+        'next': paginator.get_next_link(),
+        'previous': paginator.get_previous_link(),
+        'results': ChallengeSubscriptionSerializer(page, many=True).data,
+      },
+    )
+
+  @action(detail=True, methods=['get'])
+  def progress(self, request, *args, **kwargs):
+    """Every subscriber's progress on this challenge.
+
+    Readable by every member of the group, whether or not they subscribed -
+    watching a challenge you did not enter is the point. Rows carry the full
+    scoring breakdown, so the leaderboard needs no second call.
+    """
+    challenge = self.get_challenge()
+    self.assert_group_member(request, challenge)
+
+    payload = habit_challenges.progress_rows(challenge)
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message=RESPONSE_MESSAGES['SUCCESS'],
+      data={
+        'challenge': {
+          'id': str(challenge.id),
+          'name': challenge.name,
+          'challenge_status': challenge.challenge_status,
+          'challenge_rules': list(challenge.challenge_rules or []),
+          'challenge_winner': (
+            str(challenge.challenge_winner) if challenge.challenge_winner_id else None
+          ),
+          'challenge_winners': habit_challenges.winner_ids(challenge),
+          'start_date': challenge.start_date,
+          'end_date': challenge.end_date,
+          'participant_count': challenge.subscriptions.count(),
+        },
+        'scoring_version': habit_challenges.SCORING_VERSION,
+        'weights': habit_challenges.SCORE_WEIGHTS,
+        'minimum_engagement_ratio': habit_challenges.MIN_ENGAGEMENT_RATIO,
+        'results': payload,
+      },
+    )
+
+  def challenge_error(self, message):
+    return error_response(
+      status_code=HTTP_ERROR_CODES['VALIDATION_ERROR'],
+      message=RESPONSE_MESSAGES['VALIDATION_ERROR'],
+      errors={'detail': str(message)},
+    )
+
+
+def _forbidden(message):
+  return error_response(
+    status_code=HTTP_ERROR_CODES['FORBIDDEN'],
+    message=RESPONSE_MESSAGES['FORBIDDEN'],
+    errors={'detail': message},
+  )
 
 
 class TagViewSet(EnvelopeListMixin, ModelViewSet):
@@ -380,7 +616,7 @@ class HabitScheduleViewSet(EnvelopeListMixin, ViewSet):
   def retrieve(self, request, *args, **kwargs):
     habit = self.get_habit()
     schedule = getattr(habit, 'schedule', None)
-    data = self.get_serializer(schedule).data if schedule is not None else None
+    data = HabitScheduleSerializer(schedule).data if schedule is not None else None
     return success_response(
       status_code=HTTP_ERROR_CODES['SUCCESS'],
       message=RESPONSE_MESSAGES['SUCCESS'],
@@ -399,7 +635,7 @@ class HabitScheduleViewSet(EnvelopeListMixin, ViewSet):
   def upsert(self, request, force=False):
     habit = self.get_habit()
     partial = request.method == 'PATCH'
-    serializer = self.get_serializer(
+    serializer = HabitScheduleSerializer(
       getattr(habit, 'schedule', None),
       data=request.data,
       partial=partial,

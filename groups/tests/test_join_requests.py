@@ -1,0 +1,260 @@
+"""API tests for join requests.
+
+The direction is the point of this file: a member *asks* a registered user to
+join, and that user alone decides. Every test below that asserts a 403 is
+asserting the sender cannot accept on the recipient's behalf, or that a plain
+member cannot pull anyone in once the admins have closed that off.
+"""
+
+from django.urls import reverse
+from rest_framework import status as http
+from rest_framework.test import APITestCase
+
+from common.enums import GroupRole, JoinRequestStatus
+
+from ..models import Group, GroupJoinRequest, GroupMembership
+from .factories import join, make_group, make_user
+from .test_groups_api import GroupApiTestCase, as_id
+
+
+class JoinRequestTestCase(GroupApiTestCase):
+  def send(
+    self,
+    to_user,
+    expect=http.HTTP_201_CREATED,
+    group=None,
+    sender=None,
+    **fields,
+  ):
+    group = group or self.group
+    self.as_user(sender or self.member)
+    response = self.client.post(
+      reverse(
+        'group-join-request-list-create', kwargs={'group_id': str(group.id)}
+      ),
+      {'to_user': str(to_user.id), **fields},
+      format='json',
+    )
+    self.assertEqual(
+      response.status_code, expect, msg=f'{response.status_code} {response.data}'
+    )
+    return response
+
+  def latest(self, group=None):
+    group = group or self.group
+    return GroupJoinRequest.objects.filter(group=group).order_by('-created_at').first()
+
+
+class JoinRequestSendingTestCase(JoinRequestTestCase):
+  def test_a_member_can_request_that_a_registered_user_joins(self):
+    response = self.send(self.outsider, message='Come and train with us.')
+
+    self.assertEqual(response.data['status'], http.HTTP_201_CREATED)
+    join_request = self.latest()
+    self.assertEqual(join_request.from_user_id, self.member.id)
+    self.assertEqual(join_request.to_user_id, self.outsider.id)
+    self.assertEqual(join_request.status, JoinRequestStatus.PENDING)
+    self.assertEqual(as_id(response.data['data']['to_user']), str(self.outsider.id))
+
+  def test_the_status_and_the_sender_are_not_client_writable(self):
+    """A request that arrives already ACCEPTED would enrol somebody without
+    them ever answering."""
+    self.send(self.outsider)
+
+    join_request = self.latest()
+    self.assertEqual(join_request.status, JoinRequestStatus.PENDING)
+    self.assertEqual(join_request.from_user_id, self.member.id)
+
+  def test_you_cannot_request_yourself(self):
+    self.send(self.member, expect=http.HTTP_411_LENGTH_REQUIRED)
+
+    self.assertFalse(GroupJoinRequest.objects.filter(group=self.group).exists())
+
+  def test_an_existing_member_cannot_be_requested(self):
+    self.send(self.admin, expect=http.HTTP_411_LENGTH_REQUIRED)
+
+    self.assertIn('to_user', self.client.post(
+      reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
+      {'to_user': str(self.admin.id)},
+      format='json',
+    ).data['errors'])
+
+  def test_a_second_pending_request_is_refused(self):
+    self.send(self.outsider)
+    self.send(self.outsider, expect=http.HTTP_411_LENGTH_REQUIRED)
+
+    self.assertEqual(GroupJoinRequest.objects.filter(group=self.group).count(), 1)
+
+  def test_a_non_member_cannot_send_a_request(self):
+    """The outsider is the *target* above, never the sender. Sending is a
+    privilege of membership, so this asserts the sender side - and since the
+    outsider has no request connecting them to this group, the group itself is
+    not addressable for them at all."""
+    self.send(self.admin, expect=http.HTTP_404_NOT_FOUND, sender=self.outsider)
+
+    self.assertFalse(GroupJoinRequest.objects.filter(group=self.group).exists())
+
+  def test_admins_can_close_requests_off_for_plain_members(self):
+    """`members_can_invite` is the switch the story asks admins to have."""
+    self.group.members_can_invite = False
+    self.group.save(update_fields=['members_can_invite', 'updated_at'])
+
+    self.send(self.outsider, expect=http.HTTP_403_FORBIDDEN)
+
+    # The admins themselves are never gated by it.
+    self.as_user(self.admin)
+    response = self.client.post(
+      reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
+      {'to_user': str(self.outsider.id)},
+      format='json',
+    )
+    self.assertEqual(response.status_code, http.HTTP_201_CREATED, msg=str(response.data))
+
+  def test_join_requests_enabled_off_blocks_admins_too(self):
+    """The master switch. With it off the group is invite-only, so there is no
+    request channel at all and invitations are the way in."""
+    self.group.join_requests_enabled = False
+    self.group.save(update_fields=['join_requests_enabled', 'updated_at'])
+
+    self.send(self.outsider, expect=http.HTTP_403_FORBIDDEN)
+
+    self.as_user(self.admin)
+    response = self.client.post(
+      reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
+      {'to_user': str(self.outsider.id)},
+      format='json',
+    )
+    self.assertEqual(response.status_code, http.HTTP_403_FORBIDDEN, msg=str(response.data))
+
+
+class JoinRequestResponseTestCase(JoinRequestTestCase):
+  def setUp(self):
+    super().setUp()
+    self.send(self.outsider)
+    self.join_request = self.latest()
+
+  def detail_url(self, action=''):
+    kwargs = {
+      'group_id': str(self.group.id),
+      'pk': str(self.join_request.id),
+    }
+    name = 'group-join-request-detail'
+    if action:
+      name = f'group-join-request-{action}'
+    return reverse(name, kwargs=kwargs)
+
+  def test_only_the_recipient_can_accept(self):
+    self.as_user(self.member)
+    response = self.client.post(self.detail_url('accept'))
+
+    self.assertEqual(response.status_code, http.HTTP_403_FORBIDDEN, msg=str(response.data))
+    self.assertFalse(GroupMembership.objects.filter(group=self.group, user=self.outsider).exists())
+
+  def test_the_recipient_accepting_adds_them_to_the_group(self):
+    self.as_user(self.outsider)
+    response = self.client.post(self.detail_url('accept'))
+
+    self.assertEqual(response.status_code, http.HTTP_200_OK, msg=str(response.data))
+    self.join_request.refresh_from_db()
+    self.assertEqual(self.join_request.status, JoinRequestStatus.ACCEPTED)
+    self.assertIsNotNone(self.join_request.responded_at)
+    membership = GroupMembership.objects.get(group=self.group, user=self.outsider)
+    self.assertEqual(membership.role, GroupRole.MEMBER)
+
+  def test_only_the_recipient_can_reject(self):
+    self.as_user(self.member)
+    response = self.client.post(self.detail_url('reject'))
+
+    self.assertEqual(response.status_code, http.HTTP_403_FORBIDDEN, msg=str(response.data))
+    self.join_request.refresh_from_db()
+    self.assertEqual(self.join_request.status, JoinRequestStatus.PENDING)
+
+  def test_the_recipient_can_reject(self):
+    self.as_user(self.outsider)
+    response = self.client.post(self.detail_url('reject'))
+
+    self.assertEqual(response.status_code, http.HTTP_200_OK, msg=str(response.data))
+    self.join_request.refresh_from_db()
+    self.assertEqual(self.join_request.status, JoinRequestStatus.REJECTED)
+    self.assertFalse(GroupMembership.objects.filter(group=self.group, user=self.outsider).exists())
+
+  def test_answering_twice_is_a_411(self):
+    self.as_user(self.outsider)
+    self.client.post(self.detail_url('accept'))
+    response = self.client.post(self.detail_url('accept'))
+
+    self.assertEqual(response.status_code, http.HTTP_411_LENGTH_REQUIRED, msg=str(response.data))
+
+  def test_the_sender_can_withdraw_their_own_request(self):
+    self.as_user(self.member)
+    response = self.client.delete(self.detail_url())
+
+    self.assertEqual(response.status_code, http.HTTP_204_NO_CONTENT)
+    self.join_request.refresh_from_db()
+    self.assertEqual(self.join_request.status, JoinRequestStatus.CANCELLED)
+
+  def test_another_member_cannot_withdraw_someone_elses_request(self):
+    self.as_user(self.admin)
+    response = self.client.delete(self.detail_url())
+
+    self.assertEqual(response.status_code, http.HTTP_403_FORBIDDEN, msg=str(response.data))
+    self.join_request.refresh_from_db()
+    self.assertEqual(self.join_request.status, JoinRequestStatus.PENDING)
+
+  def test_a_stranger_cannot_even_see_the_request(self):
+    stranger = make_user('stranger@example.com')
+    self.as_user(stranger)
+
+    self.get('group-join-request-list-create', {'group_id': str(self.group.id)}, expect=http.HTTP_404_NOT_FOUND)
+    response = self.client.post(self.detail_url('accept'))
+    self.assertEqual(response.status_code, http.HTTP_404_NOT_FOUND, msg=str(response.data))
+
+
+class JoinRequestListingTestCase(JoinRequestTestCase):
+  def test_admins_see_the_whole_request_log(self):
+    self.send(self.outsider)
+
+    self.as_user(self.admin)
+    data = self.envelope_data(
+      self.get(
+        'group-join-request-list-create', {'group_id': str(self.group.id)}
+      )
+    )
+
+    self.assertEqual(data['count'], 1)
+    self.assertEqual(
+      as_id(data['results'][0]['to_user']), str(self.outsider.id)
+    )
+
+  def test_a_plain_member_only_sees_their_own(self):
+    other = make_user('another-sender@example.com')
+    join(self.group, other)
+    self.as_user(other)
+    self.client.post(
+      reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
+      {'to_user': str(self.outsider.id)},
+      format='json',
+    )
+
+    self.as_user(self.member)
+    data = self.envelope_data(
+      self.get(
+        'group-join-request-list-create', {'group_id': str(self.group.id)}
+      )
+    )
+
+    self.assertEqual(data['count'], 0)
+
+  def test_the_recipient_can_filter_to_incoming(self):
+    self.send(self.outsider)
+
+    self.as_user(self.outsider)
+    data = self.envelope_data(
+      self.get(
+        'group-join-request-list-create',
+        {'group_id': str(self.group.id)},
+        scope='incoming',
+      )
+    )
+
+    self.assertEqual(data['count'], 1)

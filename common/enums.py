@@ -60,3 +60,33 @@ class RiskLevel(models.TextChoices):
   LOW = "LOW", "Low"
   MEDIUM = "MEDIUM", "Medium"
   HIGH = "HIGH", "High"
+
+
+# ---- Group and Challenge enums ----
+
+
+class GroupRole(models.TextChoices):
+  OWNER = "owner", "Owner"
+  ADMIN = "admin", "Admin"
+  MEMBER = "member", "Member"
+
+
+class JoinRequestStatus(models.TextChoices):
+  PENDING = "pending", "Pending"
+  ACCEPTED = "accepted", "Accepted"
+  REJECTED = "rejected", "Rejected"
+  CANCELLED = "cancelled", "Cancelled"
+
+
+class InvitationStatus(models.TextChoices):
+  PENDING = "pending", "Pending"
+  ACCEPTED = "accepted", "Accepted"
+  EXPIRED = "expired", "Expired"
+  REVOKED = "revoked", "Revoked"
+
+
+class ChallengeStatus(models.TextChoices):
+  DRAFT = "draft", "Draft"
+  ACTIVE = "active", "Active"
+  COMPLETED = "completed", "Completed"
+  CANCELLED = "cancelled", "Cancelled"

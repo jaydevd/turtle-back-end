@@ -49,6 +49,16 @@ habit_schedule = HabitScheduleViewSet.as_view({
     'patch': 'partial_update',
 })
 
+# Group challenge actions, nested on the habit that carries the challenge. A
+# participant's copy routes back to its template inside the view, so these work
+# whichever row the caller holds the id of.
+habit_start_challenge = HabitViewSet.as_view({'post': 'start_challenge'})
+habit_end_challenge = HabitViewSet.as_view({'post': 'end_challenge'})
+habit_cancel_challenge = HabitViewSet.as_view({'post': 'cancel_challenge'})
+habit_subscribe = HabitViewSet.as_view({'post': 'subscribe', 'delete': 'subscribe'})
+habit_subscribers = HabitViewSet.as_view({'get': 'subscribers'})
+habit_challenge_progress = HabitViewSet.as_view({'get': 'progress'})
+
 # Literal-prefixed analytics routes must stay ABOVE `<uuid:pk>`, otherwise the
 # uuid converter swallows `insights/` and the request 404s.
 urlpatterns = [
@@ -66,5 +76,11 @@ urlpatterns = [
   path('insights/risk/', habit_risk, name='habit-insights-risk'),
   path('<uuid:habit_id>/schedule/', habit_schedule, name='habit-schedule'),
   path('<uuid:habit_id>/insights/', habit_detail_insights, name='habit-insights-detail'),
+  path('<uuid:pk>/start-challenge/', habit_start_challenge, name='habit-start-challenge'),
+  path('<uuid:pk>/end-challenge/', habit_end_challenge, name='habit-end-challenge'),
+  path('<uuid:pk>/cancel-challenge/', habit_cancel_challenge, name='habit-cancel-challenge'),
+  path('<uuid:pk>/subscribe/', habit_subscribe, name='habit-challenge-subscribe'),
+  path('<uuid:pk>/subscribers/', habit_subscribers, name='habit-challenge-subscribers'),
+  path('<uuid:pk>/progress/', habit_challenge_progress, name='habit-challenge-progress'),
   path('<uuid:pk>/', habit_detail, name='habit-detail'),
 ]

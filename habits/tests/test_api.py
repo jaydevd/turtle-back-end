@@ -56,8 +56,8 @@ class AnalyticsApiTestCase(APITestCase):
         habit, day, status=status, completed_count=completed_count
       )
 
-  def get(self, name, **params):
-    response = self.client.get(reverse(name), params)
+  def get(self, name, route_kwargs=None, **params):
+    response = self.client.get(reverse(name, kwargs=route_kwargs), params)
     self.assertEqual(
       response.status_code, http.HTTP_200_OK, msg=f'{name} -> {response.data}'
     )
@@ -448,3 +448,104 @@ class DashboardEndpointTestCase(AnalyticsApiTestCase):
     self.assertEqual(len(data['habits']), 1)
     for habit in data['habits']:
       self.assertIsInstance(habit['id'], str)
+
+
+class ScheduleEndpointTestCase(AnalyticsApiTestCase):
+  """Regression cover for `/habits/<id>/schedule/`.
+
+  `HabitScheduleViewSet` extends `ViewSet`, not `GenericViewSet`, so it has no
+  `get_serializer()`. Every action here 500'd with
+  `AttributeError: 'HabitScheduleViewSet' object has no attribute
+  'get_serializer'` while still looking correct in a review.
+  """
+
+  def url(self, habit=None):
+    habit = habit or self.make_active_habit()
+    return reverse('habit-schedule', kwargs={'habit_id': str(habit.id)})
+
+  def test_retrieve_returns_the_existing_schedule(self):
+    habit = self.make_active_habit(target_count=3)
+
+    data = self.get('habit-schedule', {'habit_id': str(habit.id)})
+
+    self.assertEqual(data['frequency_type'], 'DAILY')
+    self.assertEqual(data['target_count'], 3)
+
+  def test_retrieve_returns_null_when_no_schedule_exists(self):
+    from habits.models import Habit
+
+    habit = Habit.objects.create(
+      user=self.user, tag=self.tag, name='No schedule',
+      start_date=label(2024, 1, 1),
+    )
+
+    data = self.get('habit-schedule', {'habit_id': str(habit.id)})
+
+    self.assertIsNone(data)
+
+  def test_post_creates_a_schedule(self):
+    habit = self.make_active_habit()
+
+    response = self.client.post(
+      self.url(habit),
+      {'frequency_type': 'CUSTOM', 'target_count': 2, 'weekdays': [0, 2, 4]},
+      format='json',
+    )
+
+    self.assertEqual(
+      response.status_code, http.HTTP_201_CREATED, msg=str(response.data)
+    )
+    # `habit.schedule` was already cached by the factory; re-read the row.
+    from habits.models import HabitSchedule
+
+    self.assertEqual(
+      HabitSchedule.objects.get(habit=habit).weekdays, [0, 2, 4]
+    )
+
+  def test_patch_updates_the_schedule(self):
+    habit = self.make_active_habit()
+
+    response = self.client.patch(
+      self.url(habit), {'target_count': 5}, format='json'
+    )
+
+    self.assertEqual(response.status_code, http.HTTP_200_OK, msg=str(response.data))
+    habit.schedule.refresh_from_db()
+    self.assertEqual(habit.schedule.target_count, 5)
+
+  def test_invalid_payload_returns_411_not_500(self):
+    """Custom schedules need weekdays; that must surface as a 411."""
+    habit = self.make_active_habit()
+
+    response = self.client.post(
+      self.url(habit),
+      {'frequency_type': 'CUSTOM', 'target_count': 1, 'weekdays': []},
+      format='json',
+    )
+
+    self.assertEqual(response.status_code, http.HTTP_411_LENGTH_REQUIRED)
+
+  def test_scalar_weekdays_returns_411_not_500(self):
+    """`weekdays: 3` is not iterable. Guarding it keeps a bad payload a 411
+    instead of an unhandled TypeError."""
+    habit = self.make_active_habit()
+
+    response = self.client.post(
+      self.url(habit),
+      {'frequency_type': 'CUSTOM', 'target_count': 1, 'weekdays': 3},
+      format='json',
+    )
+
+    self.assertEqual(response.status_code, http.HTTP_411_LENGTH_REQUIRED)
+
+  def test_another_users_habit_is_a_404(self):
+    from habits.models import Habit
+
+    theirs = Habit.objects.create(
+      user=self.other, tag=make_tag(self.other), name='Theirs',
+      start_date=label(2024, 1, 1),
+    )
+
+    response = self.client.get(self.url(theirs))
+
+    self.assertEqual(response.status_code, http.HTTP_404_NOT_FOUND)

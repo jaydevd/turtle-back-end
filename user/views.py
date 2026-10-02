@@ -6,6 +6,7 @@ from django.contrib.auth import get_user_model
 from common.responses import success_response, error_response
 from common.constants import HTTP_ERROR_CODES, RESPONSE_MESSAGES
 from common.utils import get_unix_timestamp
+from groups.services import promote_invitations_for
 import traceback
 
 User = get_user_model()
@@ -50,6 +51,13 @@ class SignUp(APIView):
 
       refresh = RefreshToken.for_user(user)
       print('refresh: ', refresh)
+
+      # An email invitation is only ever issued to an address with no account, so
+      # reaching this point means the address has just become a platform user and
+      # the request the invitation stood in for can finally be made. Nobody is
+      # joined here - each invitation becomes a PENDING join request the
+      # newcomer still has to accept.
+      promote_invitations_for(user)
 
       return success_response(
         status_code=HTTP_ERROR_CODES['SUCCESS'],
