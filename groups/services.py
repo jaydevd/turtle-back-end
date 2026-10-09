@@ -7,13 +7,14 @@ re-derived the rule could drift from the view that also has to enforce it.
 Two group settings decide who may pull someone in, and they are deliberately
 orthogonal:
 
-* `join_requests_enabled` is the master switch for requests aimed at an
-  already-registered user. With it off, nobody can be pulled in by request and
-  only email invitations remain, which is how an invite-only group is run.
+* `join_requests_enabled` is the members' side of requests aimed at an
+  already-registered user. With it off, members cannot ask anybody and only the
+  admins remain able to - the group has taken requests out of the members'
+  hands rather than out of its own. It is never a switch on the admins.
 * `members_can_invite` decides whether members below the admin tier may initiate
   either channel. Owners and admins are never gated by it.
 
-A member of a group who is not an admin therefore has to be granted one of the
+A member of a group who is not an admin therefore has to be granted both of the
 two settings before they can bring anyone in, which is the behaviour the story
 asks for: admins decide whether anyone else can.
 """
@@ -65,10 +66,21 @@ def can_invite(user, group):
 
 
 def can_send_join_request(user, group):
-  """Whether `user` may request that a registered user join `group`."""
+  """Whether `user` may request that a registered user join `group`.
+
+  `join_requests_enabled` gates the members and only the members: an admin
+  turning it off is saying "nobody below me pulls people in", not "this group
+  takes no requests". The admins who set it keep the ability for themselves,
+  which is what separates this from the invite-only reading of the switch.
+  """
+  role = role_of(user, group)
+  if role in (GroupRole.OWNER, GroupRole.ADMIN):
+    return True
+  if role is None:
+    return False
   if not group.join_requests_enabled:
     return False
-  return can_invite(user, group)
+  return group.members_can_invite
 
 
 def can_create_challenge(user, group):

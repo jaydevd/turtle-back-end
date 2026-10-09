@@ -36,3 +36,28 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.email
+
+
+class GoogleIdentity(models.Model):
+    """Records that a `User` is reachable through a Google account.
+
+    `sub` is Google's stable per-account identifier, so it - not the email - is
+    what a returning Google login is matched on. An email can be changed or
+    released inside Google, and a recycled address would otherwise hand the
+    account to whoever picks it up next.
+
+    Unique on both columns: one Google account maps to exactly one user, and one
+    user has at most one Google account.
+    """
+
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='google_identity',
+    )
+    sub = models.CharField(max_length=255, unique=True)
+    email = models.EmailField()
+    created_at = models.BigIntegerField(default=get_unix_timestamp, editable=False)
+
+    def __str__(self):
+        return f'{self.email} ({self.sub})'

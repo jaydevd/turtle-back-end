@@ -149,3 +149,42 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": False,
     "BLACKLIST_AFTER_ROTATION": False,
 }
+
+# Sign in with Google
+#
+# The whole exchange is server side, so the browser never sees the client secret
+# and no Google credential is exposed through a NEXT_PUBLIC_ variable. The
+# browser is handed to Google by a redirect from `/api/user/auth/google/start/`
+# and comes back to `/api/user/auth/google/callback/`, which mints SimpleJWT and
+# redirects to `SUCCESS_URL` with the tokens in the URL fragment.
+#
+# REDIRECT_URI must be the URL the *browser* reaches, which is normally the
+# Next.js origin because the callback is proxied through /api like every other
+# call, not the Django host. SUCCESS_URL is the page on the frontend that adopts
+# the session.
+#
+# Every value defaults to empty so the project still boots - and the test suite
+# still runs - with no Google project configured at all.
+GOOGLE_OAUTH = {
+    "CLIENT_ID": env("GOOGLE_CLIENT_ID", default=""),
+    "CLIENT_SECRET": env("GOOGLE_CLIENT_SECRET", default=""),
+    "REDIRECT_URI": env("GOOGLE_REDIRECT_URI", default=""),
+    "SUCCESS_URL": env("GOOGLE_LOGIN_SUCCESS_URL", default=""),
+    # How long a signed `state` blob stays acceptable. Long enough to survive a
+    # consent screen and a password manager detour, short enough that a
+    # captured callback URL is not useful for long.
+    "STATE_MAX_AGE": 600,
+}
+
+GOOGLE_OAUTH_ENABLED = all(
+    GOOGLE_OAUTH[key] for key in ("CLIENT_ID", "CLIENT_SECRET", "REDIRECT_URI", "SUCCESS_URL")
+)
+
+# Whether a Google login may adopt an existing account that owns the same email.
+#
+# Google proves control of the address, which is normally taken as proof of
+# identity. This project has no email verification, so a password sign-up may
+# have claimed an address its author never controlled; with this on, that
+# author can later be signed into by whoever really owns the address. Turning it
+# off makes a collision a 411 that points the user at password sign-in instead.
+GOOGLE_LINK_EXISTING_ACCOUNTS = env.bool("GOOGLE_LINK_EXISTING_ACCOUNTS", default=True)

@@ -20,19 +20,21 @@ from .test_groups_api import GroupApiTestCase, as_id
 class JoinRequestTestCase(GroupApiTestCase):
   def send(
     self,
-    to_user,
+    recipient,
     expect=http.HTTP_201_CREATED,
     group=None,
     sender=None,
     **fields,
   ):
+    """Address the request by email, the way the endpoint is written to be
+    used - the recipient's account is resolved from the address server side."""
     group = group or self.group
     self.as_user(sender or self.member)
     response = self.client.post(
       reverse(
         'group-join-request-list-create', kwargs={'group_id': str(group.id)}
       ),
-      {'to_user': str(to_user.id), **fields},
+      {'email': recipient.email, **fields},
       format='json',
     )
     self.assertEqual(
@@ -55,6 +57,38 @@ class JoinRequestSendingTestCase(JoinRequestTestCase):
     self.assertEqual(join_request.to_user_id, self.outsider.id)
     self.assertEqual(join_request.status, JoinRequestStatus.PENDING)
     self.assertEqual(as_id(response.data['data']['to_user']), str(self.outsider.id))
+    # The address is the write shape and never comes back; the id is the read one.
+    self.assertNotIn('email', response.data['data'])
+    self.assertEqual(response.data['data']['to_user_email'], self.outsider.email)
+
+  def test_the_address_is_matched_case_insensitively(self):
+    self.as_user(self.member)
+    response = self.client.post(
+      reverse(
+        'group-join-request-list-create', kwargs={'group_id': str(self.group.id)}
+      ),
+      {'email': 'Outsider@Example.COM'},
+      format='json',
+    )
+
+    self.assertEqual(response.status_code, http.HTTP_201_CREATED, msg=str(response.data))
+    self.assertEqual(self.latest().to_user_id, self.outsider.id)
+
+  def test_an_unregistered_address_is_refused_with_a_pointer_to_invitations(self):
+    """The mirror image of the invitation rule, so neither channel can be used
+    for the audience the other one exists for."""
+    self.as_user(self.member)
+    response = self.client.post(
+      reverse(
+        'group-join-request-list-create', kwargs={'group_id': str(self.group.id)}
+      ),
+      {'email': 'nobody@example.com'},
+      format='json',
+    )
+
+    self.assertEqual(response.status_code, http.HTTP_411_LENGTH_REQUIRED, msg=str(response.data))
+    self.assertIn('email', response.data['errors'])
+    self.assertFalse(GroupJoinRequest.objects.exists())
 
   def test_the_status_and_the_sender_are_not_client_writable(self):
     """A request that arrives already ACCEPTED would enrol somebody without
@@ -73,9 +107,9 @@ class JoinRequestSendingTestCase(JoinRequestTestCase):
   def test_an_existing_member_cannot_be_requested(self):
     self.send(self.admin, expect=http.HTTP_411_LENGTH_REQUIRED)
 
-    self.assertIn('to_user', self.client.post(
+    self.assertIn('email', self.client.post(
       reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
-      {'to_user': str(self.admin.id)},
+      {'email': self.admin.email},
       format='json',
     ).data['errors'])
 
@@ -105,26 +139,39 @@ class JoinRequestSendingTestCase(JoinRequestTestCase):
     self.as_user(self.admin)
     response = self.client.post(
       reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
-      {'to_user': str(self.outsider.id)},
+      {'email': self.outsider.email},
       format='json',
     )
     self.assertEqual(response.status_code, http.HTTP_201_CREATED, msg=str(response.data))
 
-  def test_join_requests_enabled_off_blocks_admins_too(self):
-    """The master switch. With it off the group is invite-only, so there is no
-    request channel at all and invitations are the way in."""
+  def test_join_requests_enabled_off_blocks_plain_members(self):
+    """The switch takes requests out of the members' hands, not the group's."""
     self.group.join_requests_enabled = False
     self.group.save(update_fields=['join_requests_enabled', 'updated_at'])
 
     self.send(self.outsider, expect=http.HTTP_403_FORBIDDEN)
 
-    self.as_user(self.admin)
-    response = self.client.post(
-      reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
-      {'to_user': str(self.outsider.id)},
-      format='json',
+    self.assertFalse(GroupJoinRequest.objects.exists())
+
+  def test_admins_may_still_send_requests_when_the_switch_is_off(self):
+    """Whoever flips the switch is not bound by it: it is a setting about what
+    the members below them may do."""
+    self.group.join_requests_enabled = False
+    self.group.save(update_fields=['join_requests_enabled', 'updated_at'])
+    second = make_user('second-outsider@example.com')
+
+    for sender, recipient in ((self.admin, self.outsider), (self.owner, second)):
+      self.as_user(sender)
+      response = self.client.post(
+        reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
+        {'email': recipient.email},
+        format='json',
+      )
+      self.assertEqual(response.status_code, http.HTTP_201_CREATED, msg=str(response.data))
+
+    self.assertEqual(
+      GroupJoinRequest.objects.filter(status=JoinRequestStatus.PENDING).count(), 2
     )
-    self.assertEqual(response.status_code, http.HTTP_403_FORBIDDEN, msg=str(response.data))
 
 
 class JoinRequestResponseTestCase(JoinRequestTestCase):
@@ -232,7 +279,7 @@ class JoinRequestListingTestCase(JoinRequestTestCase):
     self.as_user(other)
     self.client.post(
       reverse('group-join-request-list-create', kwargs={'group_id': str(self.group.id)}),
-      {'to_user': str(self.outsider.id)},
+      {'email': self.outsider.email},
       format='json',
     )
 
@@ -258,3 +305,77 @@ class JoinRequestListingTestCase(JoinRequestTestCase):
     )
 
     self.assertEqual(data['count'], 1)
+
+
+class JoinRequestInboxTestCase(JoinRequestTestCase):
+  """The recipient's own inbox.
+
+  A recipient is not in `visible_groups`, so they cannot reach the group-scoped
+  route without already knowing the group id. This is the route that does not
+  need one, and without it a request addressed to somebody is invisible to them
+  until they are handed a link by hand.
+  """
+
+  def test_the_recipient_sees_the_request_without_a_group_id(self):
+    self.send(self.outsider, message='Come and train with us.')
+
+    self.as_user(self.outsider)
+    data = self.envelope_data(self.get('group-my-join-requests', scope='incoming'))
+
+    self.assertEqual(data['count'], 1)
+    row = data['results'][0]
+    self.assertEqual(as_id(row['group']), str(self.group.id))
+    self.assertEqual(row['group_name'], 'Morning Crew')
+    self.assertEqual(row['from_user_email'], self.member.email)
+    self.assertEqual(row['status'], JoinRequestStatus.PENDING)
+
+  def test_the_sender_can_follow_their_own_request_from_the_same_route(self):
+    self.send(self.outsider)
+
+    self.as_user(self.member)
+    data = self.envelope_data(self.get('group-my-join-requests', scope='outgoing'))
+
+    self.assertEqual(data['count'], 1)
+    self.assertEqual(as_id(data['results'][0]['to_user']), str(self.outsider.id))
+
+  def test_the_inbox_only_returns_rows_that_name_the_caller(self):
+    self.send(self.outsider)
+    stranger = make_user('stranger@example.com')
+
+    self.as_user(stranger)
+    data = self.envelope_data(self.get('group-my-join-requests'))
+
+    self.assertEqual(data['count'], 0)
+
+  def test_the_inbox_never_leaks_a_request_from_another_pair(self):
+    """Two people can be talking about the same group without either of them
+    being party to the other's conversation."""
+    other = make_user('another-sender@example.com')
+    join(self.group, other)
+    self.send(self.outsider, sender=other)
+
+    self.as_user(self.member)
+    data = self.envelope_data(self.get('group-my-join-requests'))
+
+    self.assertEqual(data['count'], 0)
+
+  def test_the_ids_in_the_payload_are_enough_to_answer_the_request(self):
+    """The recipient's whole path is: read the inbox, then post to the
+    group-scoped accept route with the two ids it just handed over."""
+    self.send(self.outsider)
+
+    self.as_user(self.outsider)
+    data = self.envelope_data(self.get('group-my-join-requests', scope='incoming'))
+    row = data['results'][0]
+
+    response = self.client.post(
+      reverse(
+        'group-join-request-accept',
+        kwargs={'group_id': row['group'], 'pk': row['id']},
+      )
+    )
+
+    self.assertEqual(response.status_code, http.HTTP_200_OK, msg=str(response.data))
+    self.assertTrue(
+      GroupMembership.objects.filter(group=self.group, user=self.outsider).exists()
+    )

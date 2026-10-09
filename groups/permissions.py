@@ -45,8 +45,8 @@ class IsGroupOwner(permissions.BasePermission):
 class CanInvite(permissions.BasePermission):
   """May pull a registered user in by request.
 
-  Gated on `join_requests_enabled` for everyone, and on `members_can_invite` for
-  members below the admin tier.
+  Both switches - `join_requests_enabled` and `members_can_invite` - apply to
+  members below the admin tier. Owners and admins are subject to neither.
   """
 
   message = 'You cannot send join requests for this group.'

@@ -474,6 +474,48 @@ class GroupJoinRequestViewSet(GroupEnvelopeMixin, viewsets.ModelViewSet):
     )
 
 
+class MyJoinRequestViewSet(GroupEnvelopeMixin, viewsets.GenericViewSet):
+  """`/groups/join-requests/` - every request that names the caller.
+
+  The group-scoped route cannot serve a recipient: they are not a member yet, so
+  they are not in `visible_groups`, and the only thing that lets them past
+  `GroupJoinRequestViewSet.get_group` is knowing the group id - which is exactly
+  what a request arriving out of the blue does not give them. This is the inbox
+  that does not need one, and it is the reason a recipient can see what they are
+  being asked to answer without a link handed to them by hand.
+
+  Both directions are returned, because the sender's "what did I ask and has it
+  been answered?" is the same question about the same rows. `scope` narrows it
+  the same way the group-scoped route does.
+  """
+
+  serializer_class = GroupJoinRequestSerializer
+  permission_classes = [IsAuthenticated]
+  pagination_class = StandardPagination
+  not_found_message = 'Join request not found.'
+
+  def get_queryset(self):
+    queryset = GroupJoinRequest.objects.filter(
+      Q(to_user=self.request.user) | Q(from_user=self.request.user)
+    ).select_related('group', 'from_user', 'to_user')
+
+    scope = self.request.query_params.get('scope')
+    if scope == 'incoming':
+      return queryset.filter(to_user=self.request.user)
+    if scope == 'outgoing':
+      return queryset.filter(from_user=self.request.user)
+    if scope == 'pending':
+      return queryset.filter(status=JoinRequestStatus.PENDING)
+    return queryset
+
+  def list(self, request, *args, **kwargs):
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message=RESPONSE_MESSAGES['SUCCESS'],
+      data=paginated(self, self.get_queryset(), GroupJoinRequestSerializer),
+    )
+
+
 class GroupInvitationViewSet(GroupEnvelopeMixin, viewsets.ModelViewSet):
   """`/groups/<group_id>/invitations/` - inviting an address with no account.
 

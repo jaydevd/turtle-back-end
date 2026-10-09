@@ -93,6 +93,7 @@ class GroupMembershipSerializer(serializers.ModelSerializer):
   so the promotion rules live in one place instead of in a generic update."""
 
   user_email = serializers.EmailField(source='user.email', read_only=True)
+  display_name = serializers.SerializerMethodField()
 
   class Meta:
     model = GroupMembership
@@ -101,13 +102,18 @@ class GroupMembershipSerializer(serializers.ModelSerializer):
       'group',
       'user',
       'user_email',
+      'display_name',
       'role',
       'joined_at',
       'created_at',
       'updated_at',
     ]
-    read_only_fields = ('id', 'group', 'user', 'user_email', 'joined_at', 'created_at', 'updated_at')
+    read_only_fields = ('id', 'group', 'user', 'user_email', 'display_name', 'joined_at', 'created_at', 'updated_at')
     extra_kwargs = {'role': {'required': False}}
+
+  def get_display_name(self, obj):
+    full_name = f"{obj.user.first_name} {obj.user.last_name}".strip()
+    return full_name or obj.user.email
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -118,6 +124,11 @@ class GroupMembershipSerializer(serializers.ModelSerializer):
 class GroupJoinRequestSerializer(serializers.ModelSerializer):
   """A request for a registered user to join the group.
 
+  The write shape is an **address**, not an id: `email` names the account to ask
+  and is resolved to `to_user` during validation, so nobody has to go hunting
+  for a UUID. `to_user` stays in the read shape because every list and detail
+  payload needs it, but as a read-only field it can no longer be written.
+
   `from_user` is always the caller and `status` is always PENDING on create: the
   recipient alone decides the outcome, so neither can be set by the sender.
   """
@@ -125,6 +136,7 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
   from_user_email = serializers.EmailField(source='from_user.email', read_only=True)
   to_user_email = serializers.EmailField(source='to_user.email', read_only=True)
   group_name = serializers.CharField(source='group.name', read_only=True)
+  email = serializers.EmailField(write_only=True, required=True)
 
   class Meta:
     model = GroupJoinRequest
@@ -136,6 +148,7 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
       'from_user_email',
       'to_user',
       'to_user_email',
+      'email',
       'status',
       'message',
       'responded_at',
@@ -148,6 +161,7 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
       'group_name',
       'from_user',
       'from_user_email',
+      'to_user',
       'to_user_email',
       'status',
       'responded_at',
@@ -155,7 +169,6 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
       'updated_at',
     )
     extra_kwargs = {
-      'to_user': {'required': True},
       'message': {'required': False, 'allow_blank': True},
     }
 
@@ -163,27 +176,42 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
     super().__init__(*args, **kwargs)
     if 'group' in self.fields:
       self.fields['group'].queryset = Group.objects.filter(is_deleted=False)
-    if 'to_user' in self.fields:
-      self.fields['to_user'].queryset = get_user_model().objects.filter(is_deleted=False)
+
+  def validate_email(self, value):
+    return (value or '').strip().lower()
 
   def validate(self, attrs):
     # `group` is read-only, so DRF strips it out of the payload before this
     # runs. It travels in the context instead, which also means the client
     # cannot name a group other than the one the URL already selected.
     group = self.context.get('group') or getattr(self.instance, 'group', None)
-    to_user = attrs.get('to_user', getattr(self.instance, 'to_user', None))
+    # Popped rather than read: the row stores `to_user`, so the address must not
+    # travel on into `objects.create` and be mistaken for a model field.
+    email = attrs.pop('email', None)
     requester = _request_user(self)
 
     if group is None:
       raise serializers.ValidationError({'group': 'This field is required.'})
+    if not email:
+      raise serializers.ValidationError({'email': 'This field is required.'})
+
+    to_user = get_user_model().objects.filter(
+      email__iexact=email, is_deleted=False
+    ).first()
     if to_user is None:
-      raise serializers.ValidationError({'to_user': 'This field is required.'})
+      # The mirror image of the invitation rule: that channel is for addresses
+      # with no account, this one is for addresses that have one.
+      raise serializers.ValidationError({
+        'email': 'No account uses this address. Send them an email invitation instead.'
+      })
+
     if requester is None:
+      attrs['to_user'] = to_user
       return attrs
 
     if to_user.id == requester.id:
       raise serializers.ValidationError({
-        'to_user': 'You cannot send a join request to yourself.'
+        'email': 'You cannot send a join request to yourself.'
       })
 
     if not services.is_member(requester, group):
@@ -193,7 +221,7 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
 
     if services.membership_of(to_user, group) is not None:
       raise serializers.ValidationError({
-        'to_user': 'This user is already a member of the group.'
+        'email': 'This user is already a member of the group.'
       })
 
     if GroupJoinRequest.objects.filter(
@@ -203,9 +231,13 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
       status=JoinRequestStatus.PENDING,
     ).exists():
       raise serializers.ValidationError({
-        'to_user': 'A pending join request to this user already exists.'
+        'email': 'A pending join request to this address already exists.'
       })
 
+    # Read-only fields are dropped before `validate` runs, so the resolved
+    # account is put back here - it lands in `validated_data` and reaches
+    # `create` like any other value.
+    attrs['to_user'] = to_user
     return attrs
 
 

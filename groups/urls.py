@@ -6,8 +6,9 @@ or the uuid converter swallows them, and that ordering is easier to see written
 down than to configure.
 
 Members, join requests, invitations and challenges are all nested under a group.
-The literal `invitations/` and `challenges/` segments below sit above
-`<uuid:group_id>` deliberately, for the same reason the habit routes do it.
+The literal `join-requests/`, `invitations/` and `challenges/` segments below sit
+above `<uuid:group_id>` deliberately, for the same reason the habit routes do it.
+The first two are the caller's own inbox rather than a group's.
 """
 
 from django.urls import path
@@ -18,6 +19,7 @@ from .views import (
   GroupJoinRequestViewSet,
   GroupViewSet,
   MyInvitationViewSet,
+  MyJoinRequestViewSet,
 )
 
 group_list = GroupViewSet.as_view({'get': 'list', 'post': 'create'})
@@ -48,10 +50,16 @@ group_invitation_detail = GroupInvitationViewSet.as_view({
 my_invitations = MyInvitationViewSet.as_view({'get': 'list'})
 my_invitation_accept = MyInvitationViewSet.as_view({'post': 'accept'})
 
+my_join_requests = MyJoinRequestViewSet.as_view({'get': 'list'})
+
 group_challenge_list = GroupChallengeViewSet.as_view({'get': 'list', 'post': 'create'})
 group_challenge_detail = GroupChallengeViewSet.as_view({'get': 'retrieve'})
 
 urlpatterns = [
+  # The caller's own inbox, in both directions. Above `<uuid:group_id>` for the
+  # same reason the invitations are: a recipient has no group id to work from.
+  path('join-requests/', my_join_requests, name='group-my-join-requests'),
+
   # The caller's own invitations. Above `<uuid:group_id>` so the literal segment
   # is matched before the uuid converter gets a chance to.
   path('invitations/', my_invitations, name='group-my-invitations'),
