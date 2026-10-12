@@ -1,0 +1,22 @@
+{% extends "emails/base.html" %}
+
+{% block title %}Join {{ group_name }} on {{ brand_name }}{% endblock %}
+{% block preheader %}{{ inviter_email }} invited you to join {{ group_name }} on {{ brand_name }}.{% endblock %}
+{% block heading %}Join {{ group_name }}{% endblock %}
+
+{% block content %}
+<p style="margin:0 0 16px;"><strong>{{ inviter_email }}</strong> invited you to join <strong>{{ group_name }}</strong> on {{ brand_name }}.</p>
+<p style="margin:0;">Create your account with this address and the request to join will be waiting for you in your groups. A group is where you and the people you are rooting for keep each other honest.</p>
+
+{% include "emails/_button.html" with url=signup_url label="Create your account" %}
+
+<p style="margin:24px 0 0;font-size:13px;line-height:21px;color:#5A665D;">
+{% if expires_on %}This invitation expires on {{ expires_on }}.{% else %}This invitation does not expire.{% endif %}
+If you were not expecting it, you can ignore this email.
+</p>
+{% endblock %}
+
+{% block footer %}
+<p style="margin:0;">{{ brand_tagline }}</p>
+<p style="margin:6px 0 0;">This is an automated message from {{ brand_name }}. Replies are not monitored.</p>
+{% endblock %}

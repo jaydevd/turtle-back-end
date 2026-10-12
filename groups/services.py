@@ -126,8 +126,9 @@ def cancel_expired_invitations(group=None):
   """Move `PENDING` invitations past their `expires_at` to `EXPIRED`.
 
   Expiry is resolved on read rather than by a job, so an invitation that was
-  never picked up stops looking valid the moment it lapses. Returns the number
-  of rows changed.
+  never picked up stops looking valid the moment it lapses. The pending request
+  written alongside it lapses too, or it would still be waiting for an address
+  whose invitation has run out. Returns the number of invitations changed.
   """
   now = get_unix_timestamp()
   queryset = GroupInvitation.objects.filter(
@@ -137,14 +138,40 @@ def cancel_expired_invitations(group=None):
   if group is not None:
     queryset = queryset.filter(group=group)
 
-  return queryset.update(status=InvitationStatus.EXPIRED, updated_at=now)
+  lapsed = list(queryset)
+  changed = queryset.update(status=InvitationStatus.EXPIRED, updated_at=now)
+  for invitation in lapsed:
+    cancel_invitation_request(invitation, now=now)
+
+  return changed
+
+
+def cancel_invitation_request(invitation, now=None):
+  """Retire the pending join request an invitation wrote, if it is still open.
+
+  Called when the invitation lapses, is revoked, or is claimed down a different
+  route. Matched on the email rather than an id because the request is written
+  at send time and linked to an account later; `to_email` survives linking, so a
+  single match covers both the unlinked and linked states.
+  """
+  timestamp = now if now is not None else get_unix_timestamp()
+  return GroupJoinRequest.objects.filter(
+    group_id=invitation.group_id,
+    from_user_id=invitation.invited_by_id,
+    to_email__iexact=invitation.email,
+    status=JoinRequestStatus.PENDING,
+  ).update(
+    status=JoinRequestStatus.CANCELLED,
+    responded_at=timestamp,
+    updated_at=timestamp,
+  )
 
 
 def expire_invitation(invitation, now=None):
   """Flip one invitation to EXPIRED if its deadline has passed.
 
   Returns True when this call expired it. An invitation without a deadline never
-  expires on its own.
+  expires on its own. The request it wrote is retired with it.
   """
   if invitation.status != InvitationStatus.PENDING or invitation.expires_at is None:
     return False
@@ -155,6 +182,7 @@ def expire_invitation(invitation, now=None):
   invitation.status = InvitationStatus.EXPIRED
   invitation.responded_at = get_unix_timestamp()
   invitation.save(update_fields=['status', 'responded_at', 'updated_at'])
+  cancel_invitation_request(invitation, now=invitation.responded_at)
   return True
 
 
@@ -216,17 +244,74 @@ def cancel_join_request(join_request):
   return join_request
 
 
+def open_invitation_request(invitation):
+  """Record an invitation as a pending join request addressed to its email.
+
+  An invitation is only ever sent to an address with no account, but the thing
+  the recipient eventually answers is an ordinary join request. That request is
+  written **now**, not at registration, so it is already waiting - and already
+  visible to the inviter as something they can withdraw - before the invitee has
+  done anything. `to_user` stays null and `to_email` carries the address until
+  `link_requests_for` ties it to the account the address finally registers.
+
+  Idempotent: a pending request for the same inviter and address is returned
+  rather than duplicated, so a second invitation cannot double up.
+  """
+  existing = GroupJoinRequest.objects.filter(
+    group=invitation.group,
+    from_user=invitation.invited_by,
+    to_email__iexact=invitation.email,
+    status=JoinRequestStatus.PENDING,
+  ).first()
+  if existing is not None:
+    return existing
+
+  return GroupJoinRequest.objects.create(
+    group=invitation.group,
+    from_user=invitation.invited_by,
+    to_user=None,
+    to_email=invitation.email,
+    message=f'{invitation.invited_by.email} invited you to join this group.',
+  )
+
+
+def link_requests_for(user):
+  """Attach pending requests addressed to `user`'s email to their account.
+
+  Called once, at registration. A request raised against an address with no
+  account names only that address; this is where it becomes an ordinary request
+  for a registered person, so it appears in their inbox and can never be linked
+  to anybody else. Returns the number of rows changed.
+  """
+  if user is None or not getattr(user, 'is_authenticated', False):
+    return 0
+
+  # An invitation that lapsed while the address was still unregistered must not
+  # hand over a live request now. Its request is retired before anything links.
+  cancel_expired_invitations()
+
+  return GroupJoinRequest.objects.filter(
+    to_user__isnull=True,
+    to_email__iexact=user.email,
+    status=JoinRequestStatus.PENDING,
+  ).update(to_user=user, updated_at=get_unix_timestamp())
+
+
 def promote_invitations_for(user):
   """Turn `PENDING` invitations addressed to `user` into join requests.
 
-  Called once, at registration. An invitation is only ever created for an address
-  with no account, so its arrival at this function means the address has just
-  become a platform user and the request it stood in for can finally be made -
-  the point at which the story says the request is raised.
+  Called once, at registration. `link_requests_for` runs first: an invitation
+  sent after this flow was introduced already has its request, written at send
+  time, so the newcomer's request only has to be tied to them. The loop below is
+  what remains for invitations that predate that - it makes the request that was
+  never written, and it asks the same "is there already a request for this
+  address?" question so the two paths cannot produce a duplicate.
 
   Nothing is joined here. The newcomer gets a PENDING request like anybody else
   and has to accept it, so the invitation never auto-enrols anyone.
   """
+  link_requests_for(user)
+
   now = get_unix_timestamp()
   invitations = list(
     GroupInvitation.objects.select_related('group', 'invited_by').filter(
@@ -244,9 +329,8 @@ def promote_invitations_for(user):
     if GroupJoinRequest.objects.filter(
       group=invitation.group,
       from_user=invitation.invited_by,
-      to_user=user,
       status=JoinRequestStatus.PENDING,
-    ).exists():
+    ).filter(Q(to_user=user) | Q(to_email__iexact=user.email)).exists():
       continue
 
     created.append(

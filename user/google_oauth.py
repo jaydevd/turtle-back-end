@@ -272,7 +272,7 @@ def _resolve_once(claims):
 
     # Same reason `SignUp` calls this: an invitation only ever goes to an address
     # with no account, so this address becoming a platform user is exactly the
-    # moment the invitation it stood in for can be raised.
+    # moment the request the invitation wrote can be linked to their account.
     promote_invitations_for(user)
 
     GoogleIdentity.objects.create(

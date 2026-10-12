@@ -7,6 +7,9 @@ permission layer and reads as a 404 rather than a 403. The permissions in
 need an admin.
 """
 
+import traceback
+
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q
 from rest_framework import serializers, viewsets
@@ -26,6 +29,7 @@ from habits.serializers import HabitSerializer
 from habits.views import EnvelopeListMixin
 
 from . import services
+from .emails import send_invitation_email
 from .models import Group, GroupInvitation, GroupJoinRequest, GroupMembership
 from .permissions import (
   CanCreateChallenge,
@@ -134,6 +138,52 @@ class GroupViewSet(GroupEnvelopeMixin, viewsets.ModelViewSet):
       raise NotFound('Group not found.')
     require(self.request, group, IsGroupMember)
     return group
+
+  @action(detail=True, methods=['get'], url_path='member-lookup')
+  def member_lookup(self, request, *args, **kwargs):
+    """Resolve a typed address to accounts, so the composer knows what to offer.
+
+    The join-request composer searches as the user types: a hit means "ask this
+    person", an empty result means "they are not here yet, invite them". A miss
+    is therefore a normal 200 with no rows rather than a 404. Results are capped
+    and the caller has to be able to invite at all, so this cannot be used to
+    page through the whole user table.
+    """
+    group = self.get_object()
+    # Gated on the invite switch rather than the narrower join-request one: the
+    # composer offers an email invitation whenever the caller may invite at all,
+    # and a search hit only leads to a request when requests are also enabled.
+    require(request, group, CanSendInvitation)
+
+    query = (request.query_params.get('email') or '').strip()
+    results = []
+    if len(query) >= 2:
+      member_ids = GroupMembership.objects.filter(group=group).values_list(
+        'user_id', flat=True
+      )
+      users = (
+        get_user_model()
+        .objects.filter(is_deleted=False, email__icontains=query)
+        .exclude(id__in=member_ids)
+        .exclude(id=request.user.id)
+        .order_by('email')[:8]
+      )
+      results = [
+        {
+          'id': str(user.id),
+          'email': user.email,
+          'display_name': (
+            f'{user.first_name} {user.last_name}'.strip() or user.email
+          ),
+        }
+        for user in users
+      ]
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message=RESPONSE_MESSAGES['SUCCESS'],
+      data={'results': results},
+    )
 
   def create(self, request, *args, **kwargs):
     serializer = self.get_serializer(data=request.data)
@@ -496,12 +546,17 @@ class MyJoinRequestViewSet(GroupEnvelopeMixin, viewsets.GenericViewSet):
 
   def get_queryset(self):
     queryset = GroupJoinRequest.objects.filter(
-      Q(to_user=self.request.user) | Q(from_user=self.request.user)
+      Q(to_user=self.request.user)
+      | Q(to_email__iexact=self.request.user.email)
+      | Q(from_user=self.request.user)
     ).select_related('group', 'from_user', 'to_user')
 
     scope = self.request.query_params.get('scope')
     if scope == 'incoming':
-      return queryset.filter(to_user=self.request.user)
+      return queryset.filter(
+        Q(to_user=self.request.user)
+        | Q(to_email__iexact=self.request.user.email)
+      )
     if scope == 'outgoing':
       return queryset.filter(from_user=self.request.user)
     if scope == 'pending':
@@ -519,9 +574,10 @@ class MyJoinRequestViewSet(GroupEnvelopeMixin, viewsets.GenericViewSet):
 class GroupInvitationViewSet(GroupEnvelopeMixin, viewsets.ModelViewSet):
   """`/groups/<group_id>/invitations/` - inviting an address with no account.
 
-  `POST /groups/invitations/accept/` is the far end of the link and the only way
-  an invitation becomes a membership. Nothing here joins anybody: the address has
-  to register first, and then still has to claim it.
+  An invitation is the email and the audit record; the join request is what the
+  recipient actually answers, and `create` writes both at once. The address still
+  has to register before the request can be linked to it, and
+  `POST /groups/invitations/accept/` remains an alternative claim by token.
   """
 
   serializer_class = GroupInvitationSerializer
@@ -576,12 +632,33 @@ class GroupInvitationViewSet(GroupEnvelopeMixin, viewsets.ModelViewSet):
     if not serializer.is_valid():
       return self.validation_error_response(serializer)
 
-    serializer.save(group=group, invited_by=request.user)
+    invitation = serializer.save(group=group, invited_by=request.user)
+    # The invitation is the email; the request is the thing the recipient will
+    # actually answer. Writing it here rather than at registration is what makes
+    # it appear in their inbox the instant they sign in, and what lets the
+    # inviter see and withdraw it from the same list as any other request.
+    services.open_invitation_request(invitation)
+    self._send_invitation_email(invitation)
     return success_response(
       status_code=HTTP_ERROR_CODES['CREATED'],
       message=RESPONSE_MESSAGES['CREATED'],
       data=serializer.data,
     )
+
+  @staticmethod
+  def _send_invitation_email(invitation):
+    """Deliver the invite link, tolerating a mail outage.
+
+    The invitation and the pending request it stands for are already stored, so a
+    failed send costs the newcomer their nudge, not the thing they would have
+    answered. A delivery error is worth logging, not worth failing the request
+    over.
+    """
+    try:
+      send_invitation_email(invitation)
+    except Exception:
+      print("Error when sending the group invitation email.")
+      traceback.print_exc()
 
   def retrieve(self, request, *args, **kwargs):
     return success_response(
@@ -603,6 +680,10 @@ class GroupInvitationViewSet(GroupEnvelopeMixin, viewsets.ModelViewSet):
     invitation.status = InvitationStatus.REVOKED
     invitation.responded_at = get_unix_timestamp()
     invitation.save(update_fields=['status', 'responded_at', 'updated_at'])
+    # The request is the inviter's own; revoking the invitation has to withdraw
+    # it too, or the address would still find a live request after the inviter
+    # said no.
+    services.cancel_invitation_request(invitation, now=invitation.responded_at)
 
     return success_response(
       status_code=HTTP_ERROR_CODES['200_NO_CONTENT'],
@@ -664,6 +745,9 @@ class MyInvitationViewSet(GroupEnvelopeMixin, viewsets.GenericViewSet):
     invitation.save(
       update_fields=['status', 'accepted_by', 'responded_at', 'updated_at']
     )
+    # Claiming by token and accepting the request are two doors into the same
+    # room; whichever was used, the request the invitation wrote is now spent.
+    services.cancel_invitation_request(invitation, now=invitation.responded_at)
 
     return success_response(
       status_code=HTTP_ERROR_CODES['CREATED' if created else 'SUCCESS'],

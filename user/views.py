@@ -6,11 +6,15 @@ from .models import GoogleIdentity
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from django.http import HttpResponseRedirect
 from common.responses import success_response, error_response
 from common.constants import HTTP_ERROR_CODES, RESPONSE_MESSAGES
 from common.utils import get_unix_timestamp
 from groups.services import promote_invitations_for
+from .emails import send_password_reset_email
 from urllib.parse import urlencode
 import json
 import traceback
@@ -166,9 +170,9 @@ class SignUp(APIView):
 
       # An email invitation is only ever issued to an address with no account, so
       # reaching this point means the address has just become a platform user and
-      # the request the invitation stood in for can finally be made. Nobody is
-      # joined here - each invitation becomes a PENDING join request the
-      # newcomer still has to accept.
+      # the pending request the invitation wrote can now be linked to their
+      # account. Nobody is joined here - each invitation becomes a PENDING join
+      # request the newcomer still has to accept.
       promote_invitations_for(user)
 
       return success_response(
@@ -498,6 +502,102 @@ class SetPassword(APIView):
       status_code=HTTP_ERROR_CODES['SUCCESS'],
       message='password updated successfully',
       data=UserSerializer(user).data,
+    )
+
+
+class PasswordResetRequest(APIView):
+  """Email a reset link to an address, if it has an account.
+
+  Answers the same 200 whether or not the address is registered, so the endpoint
+  cannot be used to discover who has an account here. The link is built from
+  FRONTEND_URL rather than the request host because it is opened from an inbox
+  in a browser, not proxied through Next.
+  """
+
+  permission_classes = [AllowAny]
+
+  def post(self, request):
+    serializer = PasswordResetRequestSerializer(data=request.data)
+
+    if not serializer.is_valid():
+      return error_response(
+        status_code=HTTP_ERROR_CODES['VALIDATION_ERROR'],
+        message=RESPONSE_MESSAGES['VALIDATION_ERROR'],
+        errors=serializer.errors,
+      )
+
+    email = User.objects.normalize_email(serializer.validated_data['email']).lower()
+    user = User.objects.filter(email=email, is_active=True, is_deleted=False).first()
+
+    if user is not None:
+      self._send_reset_link(user)
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message='If that email has an account, a reset link is on its way.',
+      data={},
+    )
+
+  @staticmethod
+  def _send_reset_link(user):
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    base = settings.FRONTEND_URL.rstrip('/')
+    reset_url = f"{base}/reset-password?{urlencode({'uid': uid, 'token': token})}"
+
+    try:
+      # Not silent: a delivery failure has to show up in the server log, or a
+      # misconfigured mail backend looks exactly like a user who never clicked.
+      # The response is identical either way, so this cannot leak which
+      # addresses exist.
+      send_password_reset_email(
+        user,
+        reset_url=reset_url,
+        expires_hours=settings.PASSWORD_RESET_TIMEOUT // 3600,
+      )
+    except Exception:
+      print("Error when sending the password reset email.")
+      traceback.print_exc()
+
+
+class PasswordResetConfirm(APIView):
+  """Spend a reset link and set the new password.
+
+  Open to anyone holding a valid link: the link is the proof, so there is no
+  session to require.
+  """
+
+  permission_classes = [AllowAny]
+
+  def post(self, request):
+    serializer = PasswordResetConfirmSerializer(data=request.data)
+
+    if not serializer.is_valid():
+      return error_response(
+        status_code=HTTP_ERROR_CODES['VALIDATION_ERROR'],
+        message=RESPONSE_MESSAGES['VALIDATION_ERROR'],
+        errors=serializer.errors,
+      )
+
+    user = serializer.validated_data['user']
+
+    try:
+      user.set_password(serializer.validated_data['new_password'])
+      user.updated_at = get_unix_timestamp()
+      user.save(update_fields=['password', 'updated_at'])
+    except Exception:
+      print("Error when resetting the user password.")
+      traceback.print_exc()
+      return error_response(
+        status_code=HTTP_ERROR_CODES['SERVER_ERROR'],
+        message=RESPONSE_MESSAGES['SERVER_ERROR'],
+        errors='Unable to reset the password.',
+      )
+
+    return success_response(
+      status_code=HTTP_ERROR_CODES['SUCCESS'],
+      message='password reset successfully',
+      data={},
     )
 
 

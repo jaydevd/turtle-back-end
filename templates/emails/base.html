@@ -1,0 +1,71 @@
+{% comment %}
+Branded shell shared by every transactional email.
+
+Table-based and inline-styled on purpose: mail clients drop <style> blocks and
+ignore flex/grid, so the layout has to survive on tables alone. The palette is
+the light scheme from `frontend/src/theme/tokens.ts` - warm bone paper, forest
+ink, sage primary, terracotta accent - so a message looks like the app it came
+from. Fraunces/Inter Tight are not available in an inbox, so the stacks fall back
+to a serif for display and the system sans for body copy.
+{% endcomment %}<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light only" />
+    <meta name="supported-color-schemes" content="light only" />
+    <title>{% block title %}{{ brand_name }}{% endblock %}</title>
+  </head>
+  <body style="margin:0;padding:0;background-color:#F7F5F0;-webkit-font-smoothing:antialiased;">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;visibility:hidden;">{% block preheader %}{% endblock %}</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F7F5F0;">
+      <tr>
+        <td align="center" style="padding:36px 16px;">
+          <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;">
+
+            <tr>
+              <td style="padding:0 6px 22px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td valign="middle" style="padding-right:12px;">
+                      <img src="{{ logo_url }}" width="40" height="40" alt="{{ brand_name }}" style="display:block;width:40px;height:40px;border:0;border-radius:11px;outline:none;text-decoration:none;" />
+                    </td>
+                    <td valign="middle" style="font-family:Georgia,'Times New Roman',serif;font-size:22px;font-weight:600;letter-spacing:-0.01em;color:#1C241F;">
+                      {{ brand_name }}
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="background-color:#FFFDFA;border:1px solid #E9E5DC;border-radius:18px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td style="height:4px;line-height:4px;font-size:0;background-color:#386A5A;border-radius:18px 18px 0 0;">&nbsp;</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:40px 40px 36px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:24px;color:#1C241F;">
+                      <h1 style="margin:0 0 18px;font-family:Georgia,'Times New Roman',serif;font-size:25px;line-height:33px;font-weight:600;letter-spacing:-0.01em;color:#1C241F;">{% block heading %}{% endblock %}</h1>
+                      {% block content %}{% endblock %}
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:22px 8px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:20px;color:#5A665D;">
+                {% block footer %}
+                <p style="margin:0;">{{ brand_tagline }}</p>
+                <p style="margin:6px 0 0;">This is an automated message from {{ brand_name }}.</p>
+                {% endblock %}
+              </td>
+            </tr>
+
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

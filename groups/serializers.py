@@ -129,12 +129,17 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
   for a UUID. `to_user` stays in the read shape because every list and detail
   payload needs it, but as a read-only field it can no longer be written.
 
+  A row also arrives from the invitation channel: that path writes a request with
+  `to_user` null and `to_email` holding the invited address, and registration
+  links it. So `to_user` is nullable on read, `to_email` carries the invited
+  address, and `to_user_email` resolves whichever of the two is set.
+
   `from_user` is always the caller and `status` is always PENDING on create: the
   recipient alone decides the outcome, so neither can be set by the sender.
   """
 
   from_user_email = serializers.EmailField(source='from_user.email', read_only=True)
-  to_user_email = serializers.EmailField(source='to_user.email', read_only=True)
+  to_user_email = serializers.SerializerMethodField()
   group_name = serializers.CharField(source='group.name', read_only=True)
   email = serializers.EmailField(write_only=True, required=True)
 
@@ -148,6 +153,7 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
       'from_user_email',
       'to_user',
       'to_user_email',
+      'to_email',
       'email',
       'status',
       'message',
@@ -163,6 +169,7 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
       'from_user_email',
       'to_user',
       'to_user_email',
+      'to_email',
       'status',
       'responded_at',
       'created_at',
@@ -171,6 +178,15 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
     extra_kwargs = {
       'message': {'required': False, 'allow_blank': True},
     }
+
+  def get_to_user_email(self, obj):
+    """The address the request is for, from either half of the row.
+
+    A request aimed at a registered account stores `to_user`; one raised from an
+    email invitation stores only `to_email` until that address registers. The
+    client should not have to know which, so this resolves both to the address.
+    """
+    return obj.to_user.email if obj.to_user_id else obj.to_email
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -244,9 +260,8 @@ class GroupJoinRequestSerializer(serializers.ModelSerializer):
 class GroupInvitationSerializer(serializers.ModelSerializer):
   """An invitation sent to an address that has no account yet.
 
-  The `token` is exposed because it is the whole point of the row: it is the
-  `/invite?token=` link the inviter passes on by hand. It is read-only, so it
-  can only ever be minted by the server.
+  The `token` is exposed because it can still claim the invitation outright. It
+  is read-only, so it can only ever be minted by the server.
   """
 
   invited_by_email = serializers.EmailField(source='invited_by.email', read_only=True)

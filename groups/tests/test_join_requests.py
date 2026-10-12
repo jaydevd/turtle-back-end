@@ -379,3 +379,65 @@ class JoinRequestInboxTestCase(JoinRequestTestCase):
     self.assertTrue(
       GroupMembership.objects.filter(group=self.group, user=self.outsider).exists()
     )
+
+
+class MemberLookupTestCase(JoinRequestTestCase):
+  """The composer's search-as-you-type, which decides between "ask" and "invite".
+
+  A hit is a registered account to send a request to; a miss is the signal the
+  client turns into an email invitation. That is why a miss is a normal empty
+  result rather than a 404.
+  """
+
+  def lookup(self, email, expect=http.HTTP_200_OK, sender=None):
+    self.as_user(sender or self.member)
+    response = self.client.get(
+      reverse('group-member-lookup', kwargs={'group_id': str(self.group.id)}),
+      {'email': email},
+    )
+    self.assertEqual(
+      response.status_code, expect, msg=f'{response.status_code} {response.data}'
+    )
+    return response
+
+  def test_it_finds_a_registered_non_member(self):
+    data = self.envelope_data(self.lookup('outside'))
+
+    self.assertEqual(len(data['results']), 1)
+    row = data['results'][0]
+    self.assertEqual(row['id'], str(self.outsider.id))
+    self.assertEqual(row['email'], self.outsider.email)
+    self.assertTrue(row['display_name'])
+
+  def test_members_and_the_caller_are_not_offered(self):
+    data = self.envelope_data(self.lookup('example.com'))
+
+    # The outsider matches and is offered; the three members and the caller do
+    # not, even though their addresses match the same substring.
+    self.assertEqual([row['email'] for row in data['results']], [self.outsider.email])
+
+  def test_a_short_query_returns_nothing(self):
+    data = self.envelope_data(self.lookup('o'))
+
+    self.assertEqual(data['results'], [])
+
+  def test_a_miss_is_an_empty_result_not_a_404(self):
+    data = self.envelope_data(self.lookup('nobody@example.com'))
+
+    self.assertEqual(data['results'], [])
+
+  def test_the_match_is_case_insensitive(self):
+    data = self.envelope_data(self.lookup('OUTSIDER@EXAMPLE.COM'))
+
+    self.assertEqual([row['email'] for row in data['results']], [self.outsider.email])
+
+  def test_a_non_member_cannot_search(self):
+    stranger = make_user('stranger@example.com')
+
+    self.lookup('example.com', expect=http.HTTP_404_NOT_FOUND, sender=stranger)
+
+  def test_a_member_without_invite_rights_cannot_search(self):
+    self.group.members_can_invite = False
+    self.group.save(update_fields=['members_can_invite', 'updated_at'])
+
+    self.lookup('outside', expect=http.HTTP_403_FORBIDDEN)

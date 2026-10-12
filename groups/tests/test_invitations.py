@@ -1,12 +1,16 @@
 """API tests for email invitations.
 
-An invitation is a promise made to an address, not to an account, so the two
-invariants that matter are: it cannot be minted for somebody who already has one
-(the join-request channel exists for that), and it cannot enrol anybody on its
-own. Claiming is the only way in, and it still checks whose address it is for.
+An invitation is a promise made to an address, not to an account. Two invariants
+matter: it cannot be minted for somebody who already has one (the join-request
+channel exists for that), and it cannot enrol anybody on its own. Sending one
+writes a pending join request against the address; registering links that request
+to the new account, and the newcomer still has to accept it.
 """
 
+from unittest import mock
+
 from common.utils import get_unix_timestamp
+from django.core import mail
 from django.urls import reverse
 from rest_framework import status as http
 from rest_framework.test import APITestCase
@@ -42,6 +46,68 @@ class InvitationSendingTestCase(GroupApiTestCase):
     self.assertEqual(invitation.status, InvitationStatus.PENDING)
     self.assertTrue(invitation.token)
     self.assertEqual(data['token'], str(invitation.token))
+
+  def test_creating_an_invitation_emails_the_invitee_a_branded_link(self):
+    self.invite('newcomer@example.com')
+
+    self.assertEqual(len(mail.outbox), 1)
+    message = mail.outbox[0]
+    self.assertEqual(message.to, ['newcomer@example.com'])
+    self.assertIn(self.group.name, message.subject)
+    self.assertIn('/signup?email=', message.body)
+
+    html, mimetype = message.alternatives[0]
+    self.assertEqual(mimetype, 'text/html')
+    self.assertIn('Turtle', html)
+    # The link points at sign-up with the invited address filled in, so the
+    # account they create is the one the waiting request is addressed to.
+    self.assertIn('newcomer%40example.com', html)
+
+  def test_an_invitation_writes_the_pending_join_request_immediately(self):
+    """The email is the nudge; the request is the thing they answer. It is
+    written at send time so it is already there the moment they register."""
+    self.invite('newcomer@example.com')
+
+    request = GroupJoinRequest.objects.get(
+      group=self.group, to_email__iexact='newcomer@example.com'
+    )
+    self.assertEqual(request.from_user_id, self.member.id)
+    self.assertIsNone(request.to_user)
+    self.assertEqual(request.status, JoinRequestStatus.PENDING)
+
+  def test_the_inviter_sees_the_request_in_their_sent_list(self):
+    self.invite('newcomer@example.com')
+
+    self.as_user(self.member)
+    data = self.envelope_data(
+      self.get(
+        'group-join-request-list-create',
+        route_kwargs={'group_id': str(self.group.id)},
+        scope='outgoing',
+      )
+    )
+
+    self.assertEqual(data['count'], 1)
+    self.assertEqual(data['results'][0]['to_user_email'], 'newcomer@example.com')
+
+  def test_a_failed_send_does_not_fail_the_invitation(self):
+    """A mail outage must not undo the request: the invitation is stored and the
+    pending request is written either way, so the newcomer who reaches the
+    platform by any route still finds something waiting."""
+    with mock.patch(
+      'groups.views.send_invitation_email', side_effect=OSError('smtp is down')
+    ):
+      response = self.invite('newcomer@example.com')
+
+    self.assertEqual(response.status_code, http.HTTP_201_CREATED)
+    self.assertTrue(
+      GroupInvitation.objects.filter(email='newcomer@example.com').exists()
+    )
+    self.assertTrue(
+      GroupJoinRequest.objects.filter(
+        group=self.group, to_email__iexact='newcomer@example.com'
+      ).exists()
+    )
 
   def test_the_token_is_read_only_so_only_the_server_mints_it(self):
     response = self.invite('newcomer@example.com', token='forged-token')
@@ -130,6 +196,25 @@ class InvitationSendingTestCase(GroupApiTestCase):
       pk=response.data['data']['id']
     )
     self.assertEqual(response_invitation.status, InvitationStatus.REVOKED)
+
+  def test_revoking_an_invitation_withdraws_its_request(self):
+    response = self.invite('newcomer@example.com')
+
+    self.as_user(self.member)
+    self.client.delete(
+      reverse(
+        'group-invitation-detail',
+        kwargs={
+          'group_id': str(self.group.id),
+          'pk': response.data['data']['id'],
+        },
+      )
+    )
+
+    request = GroupJoinRequest.objects.get(
+      group=self.group, to_email__iexact='newcomer@example.com'
+    )
+    self.assertEqual(request.status, JoinRequestStatus.CANCELLED)
 
 
 class InvitationClaimTestCase(GroupApiTestCase):
@@ -374,9 +459,44 @@ class SignupPromotionTestCase(APITestCase):
 
     self.sign_up()
 
-    self.assertFalse(GroupJoinRequest.objects.exists())
+    # The request written at send time lapses with the invitation: nothing is
+    # left pending for the group and nothing was linked to the newcomer.
+    self.assertFalse(
+      GroupJoinRequest.objects.filter(
+        group=self.group, status=JoinRequestStatus.PENDING
+      ).exists()
+    )
+    self.assertFalse(GroupJoinRequest.objects.filter(to_user__isnull=False).exists())
 
   def test_signing_up_someone_else_is_unaffected(self):
     self.sign_up(email='someone-else@example.com')
 
-    self.assertFalse(GroupJoinRequest.objects.exists())
+    # The pending request stays on the invited address, unlinked. Signing up an
+    # unrelated address must not claim somebody else's request.
+    self.assertFalse(GroupJoinRequest.objects.filter(to_user__isnull=False).exists())
+    self.assertTrue(
+      GroupJoinRequest.objects.filter(
+        to_email__iexact='newcomer@example.com',
+        to_user__isnull=True,
+        status=JoinRequestStatus.PENDING,
+      ).exists()
+    )
+
+  def test_the_newcomer_finds_the_request_in_their_own_inbox(self):
+    """The point of writing the request at send time: after registering, the
+    invitee sees something waiting without needing the emailed link."""
+    self.sign_up()
+
+    from user.models import User
+
+    newcomer = User.objects.get(email='newcomer@example.com')
+    self.client.force_authenticate(newcomer)
+    response = self.client.get(
+      reverse('group-my-join-requests'), {'scope': 'incoming'}
+    )
+
+    payload = response.data['data']
+    self.assertEqual(payload['count'], 1)
+    self.assertEqual(as_id(payload['results'][0]['group']), str(self.group.id))
+    self.assertEqual(payload['results'][0]['to_user_email'], 'newcomer@example.com')
+    self.assertEqual(payload['results'][0]['status'], 'pending')

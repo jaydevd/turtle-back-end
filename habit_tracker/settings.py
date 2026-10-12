@@ -67,7 +67,10 @@ ROOT_URLCONF = 'habit_tracker.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        # Project-wide templates live at the backend root; the branded
+        # transactional emails in `templates/emails/` are the only residents so
+        # far.
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -149,6 +152,44 @@ SIMPLE_JWT = {
     "ROTATE_REFRESH_TOKENS": False,
     "BLACKLIST_AFTER_ROTATION": False,
 }
+
+# Password reset
+#
+# The reset flow is email based: the request endpoint always answers the same
+# way regardless of whether the address has an account, and the link it sends
+# points at the Next.js page that collects the new password. The token is
+# Django's own password reset token, so it stops working the moment the password
+# changes.
+#
+# FRONTEND_URL is where the reset link sends the browser. It has to be the
+# browser-facing origin, not the Django host, because the link is pasted into a
+# browser rather than proxied.
+#
+FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
+
+# Real SMTP by default: a reset link has to reach the user's inbox, so the
+# console backend - which only prints the message to the server log - has to be
+# opted into explicitly for local work
+# (EMAIL_BACKEND=django.core.mail.backends.console.EmailBackend). Left as the
+# default it silently drops reset mail in production, and worse, the message it
+# prints is quoted-printable, so the link copied out of the log carries `=3D`
+# escapes and soft line breaks that make the uid/token arrive already broken.
+EMAIL_BACKEND = env(
+    "EMAIL_BACKEND", default="django.core.mail.backends.smtp.EmailBackend"
+)
+EMAIL_HOST = env("EMAIL_HOST", default="")
+EMAIL_PORT = env.int("EMAIL_PORT", default=587)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
+DEFAULT_FROM_EMAIL = env(
+    "DEFAULT_FROM_EMAIL", default="Turtle <no-reply@habittracker.local>"
+)
+
+# How long a reset link stays usable. Django's default is three days; one day is
+# long enough to survive a mail delay and short enough that a forwarded link is
+# not useful for long.
+PASSWORD_RESET_TIMEOUT = env.int("PASSWORD_RESET_TIMEOUT", default=60 * 60 * 24)
 
 # Sign in with Google
 #

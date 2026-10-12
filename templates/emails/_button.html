@@ -1,0 +1,14 @@
+{% comment %}A bulletproof-enough call to action plus the raw link under it, since
+some clients strip the button's styling and copying a link is the fallback that
+always works. Include with: {% include "emails/_button.html" with url=... label=... %}{% endcomment %}
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:24px 0 4px;">
+  <tr>
+    <td align="center" style="border-radius:11px;background-color:#386A5A;">
+      <a href="{{ url }}" style="display:inline-block;padding:14px 28px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:15px;font-weight:600;line-height:20px;color:#FFFFFF;text-decoration:none;border-radius:11px;">{{ label }}</a>
+    </td>
+  </tr>
+</table>
+<p style="margin:12px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:20px;color:#5A665D;">
+  Or paste this link into your browser:<br />
+  <a href="{{ url }}" style="color:#2C5448;text-decoration:underline;word-break:break-all;">{{ url }}</a>
+</p>

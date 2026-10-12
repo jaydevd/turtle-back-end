@@ -2,6 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 
 from common.enums import GroupRole, JoinRequestStatus, InvitationStatus
 from common.utils import get_unix_timestamp
@@ -110,8 +111,13 @@ class GroupJoinRequest(models.Model):
   to_user = models.ForeignKey(
     settings.AUTH_USER_MODEL,
     on_delete=models.CASCADE,
+    null=True, blank=True,
     related_name="received_join_requests"
   )
+  # The address a request is for when the target has no account yet. An email
+  # invitation is recorded here as an ordinary pending request, so the request
+  # already exists when the invitee registers and can be linked to them.
+  to_email = models.EmailField(blank=True, default='')
   status = models.CharField(
     max_length=20,
     choices=JoinRequestStatus.choices,
@@ -130,6 +136,17 @@ class GroupJoinRequest(models.Model):
   class Meta:
     unique_together = ("group", "from_user", "to_user", "status")
     ordering = ["-created_at"]
+    constraints = [
+      # `unique_together` cannot police the invited case: `to_user` is NULL there
+      # and SQL treats NULLs as distinct, so two pending invites to the same
+      # address would both slip through. This partial index covers exactly that
+      # pair, and only while the request is still pending.
+      models.UniqueConstraint(
+        fields=["group", "from_user", "to_email"],
+        condition=Q(status=JoinRequestStatus.PENDING, to_user__isnull=True),
+        name="gjr_unique_pending_invite",
+      ),
+    ]
     indexes = [
       models.Index(fields=["group", "status"], name="gjr_group_status_idx"),
       models.Index(fields=["to_user", "status"], name="gjr_to_status_idx"),

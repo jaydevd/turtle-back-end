@@ -6,6 +6,10 @@ urlpatterns = [
   path('auth/log-in/', LogIn.as_view(), name='log_in'),
   path('auth/log-out/', LogOut.as_view(), name='log_out'),
   path('auth/set-password/', SetPassword.as_view(), name='set_password'),
+  # Password reset is an unauthenticated, email-delivered flow: request a link,
+  # then spend it to choose a new password.
+  path('auth/password-reset/', PasswordResetRequest.as_view(), name='password_reset_request'),
+  path('auth/password-reset/confirm/', PasswordResetConfirm.as_view(), name='password_reset_confirm'),
   # Both of these answer with redirects rather than a JSON envelope, so they
   # only ever work as a browser navigation.
   path('auth/google/start/', GoogleAuthStart.as_view(), name='google_start'),

@@ -1,8 +1,10 @@
 import contextlib
 import json
+import re
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
+from django.core import mail
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
@@ -981,3 +983,174 @@ class ProfileTestCase(TestCase):
     response = self.client.patch(self.url, {'first_name': 'Grace'}, format='json')
 
     self.assertEqual(response.status_code, 401)
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class PasswordResetRequestTestCase(TestCase):
+  """Covers POST /api/user/auth/password-reset/."""
+
+  def setUp(self):
+    self.url = reverse('password_reset_request')
+    self.client = APIClient()
+    self.user = User.objects.create_user(
+      email='ada@example.com',
+      password='pw-for-tests-9',
+    )
+
+  def _request(self, email):
+    return self.client.post(self.url, {'email': email}, format='json')
+
+  def _token_from_email(self):
+    body = mail.outbox[-1].body
+    match = re.search(r'/reset-password\?(\S+)', body)
+    return parse_qs(match.group(1)) if match else {}
+
+  def test_emails_a_link_to_a_registered_address(self):
+    response = self._request('ada@example.com')
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(len(mail.outbox), 1)
+    self.assertEqual(mail.outbox[0].to, ['ada@example.com'])
+
+    # The link carries Django's uid/token pair, which is what the confirm
+    # endpoint spends.
+    params = self._token_from_email()
+    self.assertIn('uid', params)
+    self.assertIn('token', params)
+
+  def test_link_points_at_the_frontend_reset_page(self):
+    self._request('ada@example.com')
+
+    self.assertIn('/reset-password?', mail.outbox[0].body)
+
+  def test_the_email_is_branded_html_with_a_text_fallback(self):
+    self._request('ada@example.com')
+
+    message = mail.outbox[0]
+    self.assertTrue(message.alternatives)
+    html, mimetype = message.alternatives[0]
+    self.assertEqual(mimetype, 'text/html')
+    self.assertIn('Turtle', html)
+    self.assertIn('/reset-password?', html)
+    # The plain-text twin still carries a usable link for clients without HTML.
+    self.assertIn('/reset-password?', message.body)
+
+  def test_unknown_address_is_silent_but_answers_the_same(self):
+    """The endpoint must not reveal which addresses have accounts."""
+    known = self._request('ada@example.com')
+    unknown = self._request('nobody@example.com')
+
+    self.assertEqual(known.status_code, unknown.status_code)
+    self.assertEqual(known.data['message'], unknown.data['message'])
+    self.assertEqual(len(mail.outbox), 1)
+
+  def test_inactive_account_is_treated_as_missing(self):
+    self.user.is_active = False
+    self.user.save(update_fields=['is_active'])
+
+    response = self._request('ada@example.com')
+
+    self.assertEqual(response.status_code, 200)
+    self.assertEqual(len(mail.outbox), 0)
+
+  def test_malformed_email_is_rejected(self):
+    response = self._request('not-an-email')
+
+    self.assertEqual(response.status_code, 411)
+    self.assertIn('email', response.data['errors'])
+    self.assertEqual(len(mail.outbox), 0)
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class PasswordResetConfirmTestCase(TestCase):
+  """Covers POST /api/user/auth/password-reset/confirm/."""
+
+  def setUp(self):
+    self.request_url = reverse('password_reset_request')
+    self.url = reverse('password_reset_confirm')
+    self.client = APIClient()
+    self.user = User.objects.create_user(
+      email='ada@example.com',
+      password='pw-for-tests-9',
+    )
+
+  def _link_params(self):
+    self.client.post(self.request_url, {'email': 'ada@example.com'}, format='json')
+    match = re.search(r'/reset-password\?(\S+)', mail.outbox[-1].body)
+    return parse_qs(match.group(1))
+
+  def _confirm(self, params=None, **overrides):
+    params = params or self._link_params()
+    body = {
+      'uid': params['uid'][0],
+      'token': params['token'][0],
+      'new_password': 'compilers-1979',
+    }
+    body.update(overrides)
+    return self.client.post(self.url, body, format='json')
+
+  def test_sets_the_new_password(self):
+    response = self._confirm()
+
+    self.assertEqual(response.status_code, 200)
+    self.user.refresh_from_db()
+    self.assertTrue(self.user.check_password('compilers-1979'))
+
+  def test_new_password_works_at_sign_in(self):
+    self._confirm()
+
+    response = self.client.post(
+      reverse('log_in'),
+      {'email': 'ada@example.com', 'password': 'compilers-1979'},
+      format='json',
+    )
+
+    self.assertEqual(response.status_code, 200)
+    self.assertIn('access', response.data['data']['tokens'])
+
+  def test_a_link_cannot_be_spent_twice(self):
+    """Changing the password rotates the hash the token is derived from."""
+    params = self._link_params()
+    self._confirm(params)
+
+    second = self._confirm(params, new_password='coBOL-1959')
+
+    self.assertEqual(second.status_code, 411)
+    self.assertIn('token', second.data['errors'])
+    self.user.refresh_from_db()
+    self.assertTrue(self.user.check_password('compilers-1979'))
+
+  def test_a_forged_token_is_rejected(self):
+    response = self._confirm(token='not-a-real-token')
+
+    self.assertEqual(response.status_code, 411)
+    self.assertIn('token', response.data['errors'])
+    self.user.refresh_from_db()
+    self.assertTrue(self.user.check_password('pw-for-tests-9'))
+
+  def test_an_unknown_uid_is_rejected(self):
+    response = self._confirm(uid='this-is-not-valid')
+
+    self.assertEqual(response.status_code, 411)
+    self.assertIn('token', response.data['errors'])
+
+  def test_weak_password_is_rejected_by_the_shared_validators(self):
+    response = self._confirm(new_password='abc')
+
+    self.assertEqual(response.status_code, 411)
+    self.assertIn('new_password', response.data['errors'])
+    self.user.refresh_from_db()
+    self.assertTrue(self.user.check_password('pw-for-tests-9'))
+
+  def test_password_never_comes_back(self):
+    response = self._confirm()
+
+    self.assertNotIn('password', response.data.get('data', {}))
+
+  def test_bumps_updated_at(self):
+    before = self.user.updated_at
+
+    self._confirm()
+
+    self.user.refresh_from_db()
+    self.assertGreaterEqual(self.user.updated_at, before)

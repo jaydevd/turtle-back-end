@@ -31,6 +31,7 @@ group_detail = GroupViewSet.as_view({
 })
 group_members = GroupViewSet.as_view({'get': 'members'})
 group_member = GroupViewSet.as_view({'patch': 'member', 'delete': 'member'})
+group_member_lookup = GroupViewSet.as_view({'get': 'member_lookup'})
 group_transfer_ownership = GroupViewSet.as_view({'post': 'transfer_ownership'})
 
 join_request_list = GroupJoinRequestViewSet.as_view({'get': 'list', 'post': 'create'})
@@ -69,6 +70,11 @@ urlpatterns = [
   path('<uuid:pk>/', group_detail, name='group-detail'),
   path('<uuid:group_id>/members/', group_members, name='group-members'),
   path('<uuid:group_id>/members/<uuid:member_id>/', group_member, name='group-member-detail'),
+  path(
+    '<uuid:group_id>/member-lookup/',
+    group_member_lookup,
+    name='group-member-lookup',
+  ),
   path(
     '<uuid:group_id>/transfer-ownership/',
     group_transfer_ownership,

@@ -1,0 +1,14 @@
+{% autoescape off %}Join {{ group_name }} on {{ brand_name }}
+
+{{ inviter_email }} invited you to join {{ group_name }} on {{ brand_name }}.
+
+Create your account with this address and the request to join will be waiting
+for you in your groups:
+{{ signup_url }}
+
+{% if expires_on %}This invitation expires on {{ expires_on }}.{% else %}This invitation does not expire.{% endif %}
+If you were not expecting it, you can ignore this email.
+
+--
+{{ brand_tagline }}
+{% endautoescape %}

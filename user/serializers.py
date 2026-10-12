@@ -2,7 +2,10 @@ from rest_framework import serializers
 from .models import GoogleIdentity, User
 from django.contrib.auth import get_user_model, authenticate
 from django.contrib.auth.password_validation import validate_password
+from django.contrib.auth.tokens import default_token_generator
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils.encoding import force_str
+from django.utils.http import urlsafe_base64_decode
 from rest_framework_simplejwt.tokens import RefreshToken
 import traceback
 
@@ -189,3 +192,59 @@ class SetPasswordSerializer(serializers.Serializer):
       raise serializers.ValidationError({'new_password': problems})
 
     return attrs
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+  """Asks for a reset link for an address.
+
+  Deliberately only validates the shape of the address. Whether an account
+  exists behind it is a question the view answers identically either way, so
+  this endpoint cannot be used to enumerate registered emails.
+  """
+
+  email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+  """Spends a reset link and installs the new password.
+
+  `uid` and `token` are exactly what Django's `default_token_generator` issues
+  and checks; the token stops verifying as soon as the password changes, so a
+  link cannot be spent twice.
+  """
+
+  uid = serializers.CharField()
+  token = serializers.CharField()
+  new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+  default_error_messages = {
+    'invalid_token': 'This reset link is invalid or has expired. Request a new one.',
+  }
+
+  def validate(self, attrs):
+    user = self._resolve_user(attrs.get('uid'))
+
+    if user is None or not default_token_generator.check_token(user, attrs.get('token')):
+      raise serializers.ValidationError({
+        'token': [self.error_messages['invalid_token']],
+      })
+
+    problems = validate_password_strength(attrs['new_password'], user=user)
+    if problems:
+      raise serializers.ValidationError({'new_password': problems})
+
+    attrs['user'] = user
+    return attrs
+
+  @staticmethod
+  def _resolve_user(uid):
+    """The account a link names, or None when the id is malformed or unknown.
+
+    A soft-deleted or inactive account is treated the same as a missing one:
+    there is nobody the link should be allowed to sign back in.
+    """
+    try:
+      pk = force_str(urlsafe_base64_decode(uid))
+      return User.objects.get(pk=pk, is_active=True, is_deleted=False)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+      return None
